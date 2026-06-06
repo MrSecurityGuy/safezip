@@ -30,8 +30,10 @@ def resolve_member_path(
     2. Null-byte rejection.
     3. Reject absolute Unix paths (starting with ``/``) and absolute Windows
        paths (drive letter + slash, e.g. ``C:/``).
-    4. Reject any ``..`` path component.
-    5. Verify the resolved path is inside *base*.
+    4. Reject any ``..`` path component, including those hidden behind a
+       Windows drive prefix (e.g. ``C:..`` → ``..`` after stripping).
+    5. Verify the resolved, canonicalised path is inside *base* (symlinks
+       followed, so symlink-chain escapes are also caught here).
     6. Reject paths whose resolved length exceeds ``_MAX_PATH_LENGTH``.
 
     :param base: The extraction root directory (must be absolute).
@@ -76,12 +78,18 @@ def resolve_member_path(
             raise UnsafeZipError(
                 f"Path traversal detected in filename: {member_filename!r}"
             )
-        # Strip Windows-style relative drive
-        # references (e.g. "C:relpath" → "relpath")
+        # Strip Windows-style relative drive references (e.g. "C:relpath" → "relpath").
+        # IMPORTANT: check for ".." again *after* stripping the drive prefix so that
+        # a payload like "C:.." (which becomes "..") is caught here and not silently
+        # passed through to the filesystem.
         if len(part) >= 2 and part[1] == ":" and part[0].isalpha():
             part = part[2:]
             if not part:
                 continue
+            if part == "..":
+                raise UnsafeZipError(
+                    f"Path traversal detected in filename: {member_filename!r}"
+                )
         clean_parts.append(part)
 
     if not clean_parts:
@@ -92,10 +100,14 @@ def resolve_member_path(
     for part in clean_parts:
         resolved = resolved / part
 
-    # 5. Confirm the resolved path is inside base
+    # 5. Confirm the resolved path is inside base.
+    # Use .resolve() on *both* sides so that symlink chains that point outside
+    # base are also caught (not just lexical traversal).
     try:
-        resolved.relative_to(base)
-    except ValueError as err:
+        resolved_real = resolved.resolve()
+        base_real = base.resolve()
+        resolved_real.relative_to(base_real)
+    except (ValueError, RuntimeError, OSError) as err:
         raise UnsafeZipError(
             f"Resolved path escapes base directory: {resolved!r} is not under {base!r}"
         ) from err
@@ -149,6 +161,9 @@ def _verify_symlink_chain(link_path: Path, base: Path) -> None:
     """
     visited = set()
     current = link_path
+    # Resolve base once outside the loop — it doesn't change across iterations
+    # and resolving it repeatedly wastes syscalls.
+    base_real = base.resolve()
 
     while current.is_symlink():
         real = str(current.resolve())
@@ -160,8 +175,8 @@ def _verify_symlink_chain(link_path: Path, base: Path) -> None:
         visited.add(real)
 
         try:
-            current.resolve().relative_to(base.resolve())
-        except ValueError as err:
+            current.resolve().relative_to(base_real)
+        except (ValueError, RuntimeError, OSError) as err:
             raise UnsafeZipError(
                 f"Symlink chain for {link_path} exits the base directory "
                 f"at {current} → {current.resolve()}"
